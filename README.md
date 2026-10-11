@@ -54,6 +54,7 @@ What omdrop-owl does on each Wi-Fi driver comes from
 | Driver | Card | Status |
 |---|---|---|
 | `mt7925e` | MediaTek MT7925 (Framework 13) | ✅ Tested: both directions, Wi-Fi stays connected |
+| `mt76x2u` | MediaTek MT7612U USB (`0e8d:7612`) | ✅ Tested: images transferred both directions on kernel 7.2.9 using active + passive monitors; sending uses BLE wake-up. Wi-Fi is off while visible; no AP or IBSS required. |
 | `iwlwifi` | Intel AX201 | ✅ Tested: both directions on Ubuntu 24.04 (kernel 6.8), Wi-Fi is off while visible ([exclusive mode](#exclusive-mode)) |
 | `iwlwifi` | Intel AX200 | ❓ Untested in exclusive mode. Shared mode doesn't work: the driver drops injected frames while connected ([#1](https://github.com/t4t5/omdrop-owl/issues/1)) |
 | `iwlwifi` | Intel AX211 | ❓ Untested in exclusive mode. Shared mode doesn't work, monitor mode never ACKs, and an ad-hoc interface beside a connected station crashed its firmware ([#4](https://github.com/t4t5/omdrop-owl/issues/4)) |
@@ -63,6 +64,33 @@ AX200 and AX211 run in exclusive mode too, without the opt-in below.
 
 Any other card falls back to the table's `*` line, which only runs once you
 opt in with `echo 1 | sudo tee /etc/omdrop/allow-untested`.
+
+Profiles have seven fields followed by optional notes:
+
+```text
+# driver  status  mode  mon_mac  reconnect  mt76_pm  exclusive_backend
+mt76x2u   tested   exclusive station no     no       active-monitor
+iwlwifi   tested   exclusive station no     no       ibss
+```
+
+`exclusive_backend` explicitly selects how exclusive mode handles unicast:
+
+| Value | Interfaces and behavior |
+|---|---|
+| `ibss` | Creates `awdlibss0` on AWDL's BSSID to ACK unicast; OWL injects through passive `mon0`. |
+| `active-monitor` | Active `mon0` ACKs unicast; the existing station becomes a passive monitor to provide the channel context. Requires hardware active-monitor support and `mon_mac=station`. |
+
+The field is ignored in shared mode; use `ibss` there. Selection does not
+depend on the driver name, and an unsupported active-monitor selection fails
+before changing the station rather than falling back to IBSS. The packaged
+MT7612U profile selects `active-monitor`; Intel selects `ibss`.
+
+To change the selection, put a driver row in `/etc/omdrop/owl-profiles`, or
+`$OMDROP_CONF/owl-profiles` during development, and change its seventh field.
+For example, use `mt76x2u untested exclusive station no no ibss` to try the
+IBSS backend. Existing exclusive overrides using the old six-field format
+must add `ibss` or `active-monitor` before any notes. Stop an open window and
+start a new one to apply profile changes.
 
 ### Adding your card
 
@@ -131,9 +159,13 @@ interface and restores its original link state and NetworkManager ownership
 when stopped, on expiry, or after a startup failure. If no AP was connected,
 teardown skips the reconnect workaround, even with `reconnect-after=1`.
 
+### IBSS
+
+Profiles selecting `exclusive_backend=ibss` use the path below.
+
 - **An ad-hoc (IBSS) interface joins AWDL's BSSID**, so the firmware ACKs the
-  phone's unicast and sees its ACKs, which a monitor interface alone never
-  does.
+  phone's unicast and sees its ACKs, which a passive monitor interface alone
+  does not do.
 - **The cell is HT20**, because the iPhone sends at HT rates and ignores us
   until it restarts if we can't ACK them.
 - **It runs on channel 6**: the helper tries 44 and 149 first, but the AX201
@@ -147,6 +179,42 @@ teardown skips the reconnect workaround, even with `reconnect-after=1`.
 - **OWL advertises our channel in all 16 slots** with `-S pin` (`owl-06`), and
   **elects its sync master by metric** with `-E` (`owl-04`), as Apple devices
   do.
+
+### Active monitor
+
+Profiles selecting `exclusive_backend=active-monitor` use this path, tested
+on the MT7612U with kernel 7.2.9:
+
+- **An active monitor (`mon0`) carries the station's MAC**, so the hardware
+  ACKs the phone's incoming unicast to that address. This requires the card's
+  advertised active-monitor support and `mon_mac=station`.
+- **The existing station becomes a passive monitor**, brought up before
+  `mon0` to provide the radio's channel context. On this card an active
+  monitor alone accepted channel changes but kept receiving on channel 1;
+  the passive context made the changes take effect. No extra tuning
+  interface or IBSS cell is created.
+- **The radio is set to HT20 through `mon0`**, using `iw dev mon0 set freq`.
+  Received packet headers confirmed the selected channel, rather than
+  relying only on the frequency reported by `iw`.
+- **It prefers channel 6**, then tries 44 and 149 if permitted by the card's
+  current regulatory restrictions. The radio stays on the selected channel
+  for the window.
+- **OWL injects through the active monitor** with `-F` (`owl-03`): multicast
+  in any slot, and unicast whenever the phone is on our channel, sent once
+  without waiting for an ACK (`owl-05`) so a missed frame doesn't stall the
+  queue behind 15 retries.
+- **OWL advertises our channel in all 16 slots** with `-S pin` (`owl-06`), and
+  **elects its sync master by metric** with `-E` (`owl-04`), as Apple devices
+  do.
+- **Teardown restores the station's original type first**, before restoring
+  its link state and NetworkManager ownership. Stop, expiry and failed
+  startup use the same restoration path.
+
+Sending an image to an iPhone passed using BLE wake-up. Receiving a 261 kB
+PNG passed with `/Discover`, `/Ask` and `/Upload` returning HTTP 200, and the
+saved image passed an integrity check. Converting the existing interface to
+IBSS also joined successfully, but a send through that setup timed out at
+HTTPS `/Discover`; the active-monitor setup passed the same send.
 
 ## Known issues
 

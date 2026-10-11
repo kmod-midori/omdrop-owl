@@ -44,6 +44,13 @@ if [ -z "$STA" ]; then
 fi
 [ -n "$STA" ] || { echo "no managed Wi-Fi interface found"; exit 1; }
 DRV=$(basename "$(readlink -f "/sys/class/net/$STA/device/driver")")
+# USB adapters have no PCI address. Keep the USB ID and product in reports.
+DEV=$(readlink -f "/sys/class/net/$STA/device")
+if [ -r "$DEV/../idVendor" ]; then
+  CARD="$(cat "$DEV/../product" 2>/dev/null) (USB $(cat "$DEV/../idVendor"):$(cat "$DEV/../idProduct"))"
+else
+  CARD=$(lspci -s "$(basename "$DEV")" 2>/dev/null | cut -d' ' -f2-)
+fi
 
 START=$(date +%s)
 OUT=$PWD/owl-test-$DRV-$(date +%Y%m%d-%H%M%S)
@@ -97,7 +104,7 @@ collect() {
   journalctl -k --since "@$START" --no-pager > "$OUT/kernel.log" 2>/dev/null
   {
     echo "omdrop-owl card test, $(date -Is)"
-    echo "card: $(lspci -s "$(basename "$(readlink -f "/sys/class/net/$STA/device")")" 2>/dev/null | cut -d' ' -f2-)"
+    echo "card: $CARD"
     echo "driver: $DRV, kernel $(uname -r), $(. /etc/os-release && echo "$PRETTY_NAME")"
     echo "profile: $(cat "$RUN/profile" 2>/dev/null)"
     printf '%s\n' "${RESULTS[@]}"
@@ -111,6 +118,7 @@ step "System"
 {
   uname -a
   . /etc/os-release && echo "$PRETTY_NAME"
+  echo "card: $CARD"
   lspci -nnk 2>/dev/null | grep -iA3 'network\|wireless'
   command -v ethtool >/dev/null && ethtool -i "$STA"
   iw dev "$STA" link
