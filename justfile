@@ -18,4 +18,4 @@ test *ARGS: build
     sudo tools/test-card.sh --lib build/lib {{ARGS}}
 
 # Optional recipes for this checkout's local development workflow.
-import? 'justfile.local'
+import? 'dev/justfile.local'

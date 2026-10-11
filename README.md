@@ -145,8 +145,7 @@ anything, is in the way.
 For development: `just build` assembles the same files in `build/lib`, and
 `just test` runs the card test against them. The helper and card test accept
 `OMDROP_CONF` for a configuration directory other than `/etc/omdrop`; pass it
-through `sudo env` when testing as root. Optional recipes in `justfile.local`
-are ignored by Git.
+through `sudo env` when testing as root.
 
 ## Exclusive mode
 
