@@ -9,6 +9,7 @@
 #   mode       shared: AWDL shares the AP's channel and Wi-Fi stays connected
 #              exclusive: Wi-Fi is disconnected for the window, for cards that
 #              can't inject, or hear AWDL, while associated (README)
+#              works without an AP and only reconnects a previously connected station
 #   mon_mac    station: the monitor interface carries the station's MAC, and OWL
 #              reads it from there; own: it keeps a MAC of its own and OWL is
 #              given the station's (owl -m)

@@ -29,6 +29,7 @@
 # A card whose profile says "exclusive" can't do that (Intel). Its station
 # comes down for the window, and an ad-hoc vif on AWDL's own BSSID sits beside
 # the monitor vif on a channel the card may transmit on: see exclusive_up.
+# An offline station needs no AP reconnect.
 #
 # ROOT: required. Callers come through pkexec, which drops the environment, so
 # everything lives at fixed paths: helpers beside this script (/usr/lib/omdrop
@@ -84,7 +85,7 @@ station_iface() {
   [ -n "$forced" ] && { echo "$forced"; return; }
   for d in /sys/class/net/*/phy80211; do
     name=$(basename "$(dirname "$d")")
-    [ "$name" = "$IF" ] || [ "$name" = "$MON" ] || [ "$name" = "$IBSS" ] && continue
+    case "$name" in "$IF"|"$MON"|"$IBSS") continue ;; esac
     iw dev "$name" info 2>/dev/null | grep -q 'type managed' || continue
     echo "$name"
     return
@@ -114,6 +115,17 @@ untested_hint() {
 
 mt76_dir() { echo "/sys/kernel/debug/ieee80211/$(basename "$(readlink -f "/sys/class/net/$1/phy80211")")/mt76"; }
 
+radio_blocked() {  # STA; sysfs works without root or access to /dev/rfkill
+  local phy d
+  phy=$(basename "$(readlink -f "/sys/class/net/$1/phy80211")")
+  for d in /sys/class/ieee80211/"$phy"/rfkill*; do
+    if [ "$(cat "$d/soft" 2>/dev/null)" = 1 ] || [ "$(cat "$d/hard" 2>/dev/null)" = 1 ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # ------------------------------------------------------------- exclusive mode
 
 # AWDL's channels this card may transmit on, 5 GHz first: an iPhone gives
@@ -133,6 +145,24 @@ tx_channels() {  # PHY
   done
 }
 
+# Save the station state, release its radio, and start the IBSS backend.
+exclusive_up() {  # STA PHY FREQ...
+  local sta=$1 phy=$2 link=down managed
+  # An idle managed interface can still scan/hold a channel. Pause it for the
+  # dedicated radio, then restore its original link and ownership state.
+  # This is not an AP disassociation when the station was already offline.
+  ip -o link show dev "$sta" | grep -qE '<([^>]*,)?UP(,|>)' && link=up
+  managed=$(nmcli -g GENERAL.NM-MANAGED device show "$sta" 2>/dev/null)
+  case "$managed" in yes|no) ;; *) return 1 ;; esac
+  echo "$link $managed" > "$RUN/exclusive-state"
+  echo "$sta" > "$RUN/exclusive"
+  if [ "$managed" = yes ]; then
+    nmcli device set "$sta" managed no >/dev/null 2>&1 || return 1
+  fi
+  ip link set "$sta" down || return 1
+  exclusive_ibss_up "$@"
+}
+
 # Take the station off the air and put an ad-hoc vif in its place. AWDL's
 # frames are IBSS frames with a fixed BSSID, so joining that "IBSS" gives the
 # firmware an address to ACK for and a BSSID filter that passes AWDL, and
@@ -147,18 +177,14 @@ tx_channels() {  # PHY
 # AWDL's BSSID, which no AWDL device beacons with, and an iPhone restarted
 # beside a cell beaconing every 100 TU didn't list us where one beside a cell
 # beaconing every 10 s did (once each).
-# NetworkManager has to let go of the station first, or it brings it straight
-# back; $RUN/exclusive tells `stop` to give it back.
-# Prints the frequency the cell started on.
-exclusive_up() {  # STA PHY FREQ...
+exclusive_ibss_up() {  # STA PHY FREQ...
   local sta=$1 phy=$2 f
   shift 2
-  echo "$sta" > "$RUN/exclusive"
-  nmcli device set "$sta" managed no >/dev/null 2>&1
-  ip link set "$sta" down
   iw dev "$IBSS" del 2>/dev/null
   iw phy "$phy" interface add "$IBSS" type ibss || return 1
-  ip link set "$IBSS" address "$(cat "/sys/class/net/$sta/address")"
+  # Development runs have no installed NetworkManager unmanaged-devices rule.
+  nmcli device set "$IBSS" managed no >/dev/null 2>&1
+  ip link set "$IBSS" address "$(cat "/sys/class/net/$sta/address")" || return 1
   # IP runs on awdl0. Left alone, the kernel and avahi take this vif for a
   # network too and send plain IPv6 on AWDL's BSSID.
   sysctl -qw "net.ipv6.conf.$IBSS.disable_ipv6=1" 2>/dev/null
@@ -175,16 +201,19 @@ exclusive_up() {  # STA PHY FREQ...
   return 1
 }
 
-# NetworkManager reconnects by itself once it has the station back.
+# Restore link state and ownership, without explicitly associating an offline
+# station. The reconnect workaround below is gated by the initial AP state.
 exclusive_down() {
-  local sta
+  local sta link=up managed=yes
   iw dev "$IBSS" ibss leave 2>/dev/null
   iw dev "$IBSS" del 2>/dev/null
   sta=$(cat "$RUN/exclusive" 2>/dev/null)
-  [ -n "$sta" ] || return 0
-  ip link set "$sta" up 2>/dev/null
-  nmcli device set "$sta" managed yes >/dev/null 2>&1
-  rm -f "$RUN/exclusive"
+  if [ -n "$sta" ]; then
+    [ ! -r "$RUN/exclusive-state" ] || read -r link managed < "$RUN/exclusive-state"
+    ip link set "$sta" "$link" 2>/dev/null || return 1
+    nmcli device set "$sta" managed "$managed" >/dev/null 2>&1 || return 1
+  fi
+  rm -f "$RUN/exclusive" "$RUN/exclusive-state"
 }
 
 # --------------------------------------------------------------------- status
@@ -225,12 +254,15 @@ cmd_status() {
 # randomise their AWDL address, so nothing here remembers one.
 cmd_peers() {
   [ -r "$OWL_LOG" ] || die "no OWL log at $OWL_LOG; is the radio up?" 4
-  grep -oE '(add|remove) peer [0-9a-f:]+' "$OWL_LOG" | awk '
-    { n = split($3, o, ":"); mac = ""
+  # Parse directly: grep returns 1 when no peers have been heard, and with
+  # pipefail that wrongly made a valid empty peer list an error.
+  awk 'match($0, /(add|remove) peer [0-9a-f:]+/) {
+      split(substr($0, RSTART, RLENGTH), event, " ")
+      n = split(event[3], o, ":"); mac = ""
       for (i = 1; i <= n; i++) mac = mac (i > 1 ? ":" : "") sprintf("%02s", o[i])
       gsub(/ /, "0", mac)
-      if ($1 == "add") seen[mac] = 1; else delete seen[mac] }
-    END { for (m in seen) print m " rssi=?" }'
+      if (event[1] == "add") seen[mac] = 1; else delete seen[mac] }
+    END { for (m in seen) print m " rssi=?" }' "$OWL_LOG"
 }
 
 # ---------------------------------------------------------------------- probe
@@ -253,6 +285,7 @@ cmd_probe() {
   else
     [ -x "$OWL_BIN" ] || missing+=("backend|omdrop-owl is installed without OWL ($OWL_BIN). Reinstall omdrop-owl.")
     [ "$PROF_MODE" = shared ] || [ "$PROF_MODE" = exclusive ] || missing+=("backend|This Wi-Fi card's profile asks for \"$PROF_MODE\" mode, which omdrop-owl doesn't implement yet.")
+    radio_blocked "$sta" && missing+=("radio|Wi-Fi is blocked. Enable the Wi-Fi radio (nmcli radio wifi on) or release its hardware switch before starting AirDrop.")
     ap=$(iw dev "$sta" link 2>/dev/null | awk '/freq:/ {print int($2)}')
     case "$PROF_MODE:$ap" in
       exclusive:*|*:2437|*:5220|*:5745) ;;
@@ -274,7 +307,7 @@ print(json.dumps({"backend": "owl", "version": os.environ["V"], "contract": os.e
 cmd_stop() {
   local why=${1:-stopped} sup sta pm reconnect
   need_root
-  exec 9> "$RUN/lock" 2>/dev/null || { mkdir -p "$RUN"; exec 9> "$RUN/lock"; }
+  { exec 9> "$RUN/lock"; } 2>/dev/null || { mkdir -p "$RUN"; exec 9> "$RUN/lock"; }
   flock 9
   sup=$(pid_of supervisor)
   # The supervisor calls `stop expired` itself; don't kill the caller.
@@ -284,7 +317,11 @@ cmd_stop() {
   pkill -f "^$OWL_BIN " 2>/dev/null
   ip link set "$MON" down 2>/dev/null
   iw dev "$MON" del 2>/dev/null
-  exclusive_down
+  if ! exclusive_down; then
+    log "error: could not restore the station interface; run stop again to retry"
+    echo "omdrop-discoverable: could not restore the station interface; run stop again to retry" >&2
+    return 4
+  fi
   sta=$(cat "$RUN/station" 2>/dev/null)
   pm=$(cat "$RUN/pm" 2>/dev/null)
   if [ -n "$sta" ] && [ -n "$pm" ]; then
@@ -302,11 +339,11 @@ cmd_stop() {
     1) reconnect=yes ;;
     *) reconnect=$(awk '{print $4}' "$RUN/profile" 2>/dev/null) ;;
   esac
-  if [ -n "$sta" ] && [ "$reconnect" = yes ]; then
+  if [ -n "$sta" ] && [ "$reconnect" = yes ] && [ "$(cat "$RUN/associated" 2>/dev/null)" = yes ]; then
     sleep 1
     nmcli -w 20 device connect "$sta" >/dev/null 2>&1 || iw dev "$sta" disconnect 2>/dev/null
   fi
-  rm -f "$RUN/supervisor.pid" "$RUN/owl.pid" "$RUN/until"
+  rm -f "$RUN/supervisor.pid" "$RUN/owl.pid" "$RUN/until" "$RUN/associated"
   printf '%s' "$why" > "$RUN/reason"
   log "stopped ($why)"
   return 0
@@ -349,6 +386,11 @@ cmd_start() {
     log "already discoverable; window now ${secs}s"
     exit 5
   fi
+  # An interrupted window may have left the station unmanaged. Restore it
+  # before saving a new snapshot, so start never overwrites recovery state.
+  if [ -e "$RUN/exclusive" ]; then
+    cmd_stop interrupted >/dev/null || die "could not restore the previous exclusive window; run stop again to retry" 4
+  fi
   : > "$RUN/log"
   : > "$RUN/announce.log"
   rm -f "$RUN/reason"
@@ -362,6 +404,12 @@ cmd_start() {
   fi
   [ "$PROF_MODE" = shared ] || [ "$PROF_MODE" = exclusive ] || die "this Wi-Fi card's profile asks for \"$PROF_MODE\" mode, which omdrop-owl doesn't implement yet" 4
   phy=$(basename "$(readlink -f "/sys/class/net/$sta/phy80211")")
+  radio_blocked "$sta" && die "Wi-Fi is blocked. Enable the Wi-Fi radio (nmcli radio wifi on) or release its hardware switch before starting AirDrop." 3
+  if iw dev "$sta" link | grep -q '^Connected to '; then
+    echo yes > "$RUN/associated"
+  else
+    echo no > "$RUN/associated"
+  fi
   if [ "$PROF_MODE" = exclusive ]; then
     gw=none
     freqs=$(tx_channels "$phy")
@@ -369,7 +417,7 @@ cmd_start() {
     # From here a failure has to give Wi-Fi back, which is cmd_stop's job.
     if ! ap=$(exclusive_up "$sta" "$phy" $freqs); then
       cmd_stop start-failed >/dev/null
-      die "could not start the ad-hoc interface $IBSS on any of AirDrop's channels" 4
+      die "could not start $PROF_MODE mode on any of AirDrop's channels" 4
     fi
   else
     # Wi-Fi takes a few seconds after a driver reload to associate and get an
@@ -397,6 +445,7 @@ cmd_start() {
     cmd_stop start-failed >/dev/null
     die "could not create the monitor interface $MON" 4
   fi
+  nmcli device set "$MON" managed no >/dev/null 2>&1
   # mon_mac: the station's MAC on the monitor interface, or one of its own
   # (locally administered, derived from the station's) with OWL told the
   # station's through -m.
@@ -406,7 +455,10 @@ cmd_start() {
   else
     monmac=$stamac
   fi
-  ip link set "$MON" address "$monmac"
+  if ! ip link set "$MON" address "$monmac"; then
+    cmd_stop start-failed >/dev/null
+    die "could not set the monitor interface address" 4
+  fi
   if ! ip link set "$MON" up; then
     cmd_stop start-failed >/dev/null
     die "could not bring $MON up" 4

@@ -115,13 +115,21 @@ on from the bar. `/usr/lib/omdrop/omdrop-discoverable probe` says what, if
 anything, is in the way.
 
 For development: `just build` assembles the same files in `build/lib`, and
-`just test` runs the card test against them.
+`just test` runs the card test against them. The helper and card test accept
+`OMDROP_CONF` for a configuration directory other than `/etc/omdrop`; pass it
+through `sudo env` when testing as root. Optional recipes in `justfile.local`
+are ignored by Git.
 
 ## Exclusive mode
 
 An Intel AX201 passes up no AWDL frames while associated, so its profile says
 `mode exclusive`: Wi-Fi is off while the machine is visible, and `stop` gives
 it back to NetworkManager.
+
+No AP or Wi-Fi default route is required. Exclusive mode pauses the station
+interface and restores its original link state and NetworkManager ownership
+when stopped, on expiry, or after a startup failure. If no AP was connected,
+teardown skips the reconnect workaround, even with `reconnect-after=1`.
 
 - **An ad-hoc (IBSS) interface joins AWDL's BSSID**, so the firmware ACKs the
   phone's unicast and sees its ACKs, which a monitor interface alone never

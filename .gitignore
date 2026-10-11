@@ -2,6 +2,11 @@
 /upstream/
 # The assembled runtime directory.
 /build/
+# Checkout-local development helpers and recipes.
+/justfile.local
+/tools/dev-configure.sh
+/tools/dev-send.sh
+/tools/test-exclusive-state.sh
 # makepkg: its git clones (SRCDEST defaults to here), work trees and packages.
 /owl/
 /googletest/

@@ -31,14 +31,14 @@ fi
 H=$LIB/omdrop-discoverable
 [ -x "$H" ] || { echo "no helper at $H: install the package, or run tools/build-owl.sh and tools/stage.sh"; exit 2; }
 RUN=/run/omdrop-owl
-CONF=/etc/omdrop
+CONF=${OMDROP_CONF:-/etc/omdrop}
 
 # The station and its driver, the same way the helper finds them.
 STA=$(head -1 "$CONF/infra-iface" 2>/dev/null | tr -d '[:space:]')
 if [ -z "$STA" ]; then
   for d in /sys/class/net/*/phy80211; do
     n=$(basename "$(dirname "$d")")
-    [ "$n" = awdl0 ] || [ "$n" = mon0 ] && continue
+    case "$n" in awdl0|mon0|awdlibss0) continue ;; esac
     iw dev "$n" info 2>/dev/null | grep -q 'type managed' && { STA=$n; break; }
   done
 fi
@@ -133,12 +133,14 @@ fi
 result probe ready
 
 GW=$(ip -4 route show default dev "$STA" | awk '{print $3; exit}')
-[ -n "$GW" ] || { result wifi "no default route on $STA"; exit 1; }
-
-step "Baseline: ping $GW for 10 s"
-ping -O -i 1 -c 10 -W 1 -I "$STA" "$GW" > "$OUT/ping-baseline.log" 2>&1
-read -r tx rx gap <<< "$(gaps "$OUT/ping-baseline.log")"
-result baseline "$rx/$tx replies"
+if [ -n "$GW" ]; then
+  step "Baseline: ping $GW for 10 s"
+  ping -O -i 1 -c 10 -W 1 -I "$STA" "$GW" > "$OUT/ping-baseline.log" 2>&1
+  read -r tx rx gap <<< "$(gaps "$OUT/ping-baseline.log")"
+  result baseline "$rx/$tx replies"
+else
+  result baseline "skipped (no Wi-Fi default route; dedicated radio modes do not need one)"
+fi
 
 step "Start"
 t0=$(date +%s%N)
@@ -152,8 +154,11 @@ if [ "$rc" != 0 ]; then
 fi
 result start "ok in ${dt} ms"
 ip -br link show dev awdl0; ip -br link show dev mon0
-ping -D -O -i 1 -W 1 -I "$STA" "$GW" > "$OUT/ping-window.log" 2>&1 &
-PINGER=$!
+MODE=$(awk '{print $2}' "$RUN/profile")
+if [ -n "$GW" ] && [ "$MODE" = shared ]; then
+  ping -D -O -i 1 -W 1 -I "$STA" "$GW" > "$OUT/ping-window.log" 2>&1 &
+  PINGER=$!
+fi
 while sleep 2; do echo "$(date +%T) $("$H" status --json)"; done > "$OUT/status.log" 2>&1 &
 WATCHER=$!
 
@@ -216,9 +221,13 @@ fi
 
 step "Stop"
 kill "$WATCHER" 2>/dev/null; WATCHER=
-kill -INT "$PINGER" 2>/dev/null; wait "$PINGER" 2>/dev/null; PINGER=
-read -r tx rx gap <<< "$(gaps "$OUT/ping-window.log")"
-result "Wi-Fi during the window" "$rx/$tx replies, longest gap ${gap} s"
+if [ -n "$PINGER" ]; then
+  kill -INT "$PINGER" 2>/dev/null; wait "$PINGER" 2>/dev/null; PINGER=
+  read -r tx rx gap <<< "$(gaps "$OUT/ping-window.log")"
+  result "Wi-Fi during the window" "$rx/$tx replies, longest gap ${gap} s"
+else
+  result "Wi-Fi during the window" "skipped ($MODE mode, no Wi-Fi traffic baseline)"
+fi
 t0=$(date +%s%N)
 "$H" stop
 rc=$?
@@ -227,23 +236,27 @@ result stop "exit $rc in $(( ($(date +%s%N) - t0) / 1000000 )) ms"
 receiver_off
 
 step "Watch Wi-Fi for $WATCH s after teardown (Ctrl-C ends the watch early)"
-# In the background, so Ctrl-C ends only the ping and its summary still lands.
-ping -D -O -i 1 -W 1 -c "$WATCH" -I "$STA" "$GW" > "$OUT/ping-after.log" 2>&1 &
-PINGER=$!
-trap 'kill -INT "$PINGER" 2>/dev/null' INT
-while kill -0 "$PINGER" 2>/dev/null; do
+if [ -n "$GW" ] && [ "$WATCH" -gt 0 ]; then
+  # In the background, so Ctrl-C ends only the ping and its summary still lands.
+  ping -D -O -i 1 -W 1 -c "$WATCH" -I "$STA" "$GW" > "$OUT/ping-after.log" 2>&1 &
+  PINGER=$!
+  trap 'kill -INT "$PINGER" 2>/dev/null' INT
+  while kill -0 "$PINGER" 2>/dev/null; do
+    read -r tx rx gap <<< "$(gaps "$OUT/ping-after.log")"
+    printf '\r  %d s: %d missed, longest gap %d s ' "$(grep -c icmp_seq "$OUT/ping-after.log")" \
+      "$(grep -c 'no answer' "$OUT/ping-after.log")" "$gap"
+    sleep 1
+  done
+  wait "$PINGER" 2>/dev/null; PINGER=
+  trap 'exit 130' INT
+  echo
   read -r tx rx gap <<< "$(gaps "$OUT/ping-after.log")"
-  printf '\r  %d s: %d missed, longest gap %d s ' "$(grep -c icmp_seq "$OUT/ping-after.log")" \
-    "$(grep -c 'no answer' "$OUT/ping-after.log")" "$gap"
-  sleep 1
-done
-wait "$PINGER" 2>/dev/null; PINGER=
-trap 'exit 130' INT
-echo
-read -r tx rx gap <<< "$(gaps "$OUT/ping-after.log")"
-result "Wi-Fi after teardown" "$rx/$tx replies, longest gap ${gap} s"
-if [ "${gap:-0}" -ge 5 ]; then
-  echo "  The station stopped receiving after teardown: keep \"reconnect yes\"."
+  result "Wi-Fi after teardown" "$rx/$tx replies, longest gap ${gap} s"
+  if [ "${gap:-0}" -ge 5 ]; then
+    echo "  The station stopped receiving after teardown: keep \"reconnect yes\"."
+  fi
+else
+  result "Wi-Fi after teardown" "skipped (no Wi-Fi default route, or --watch 0)"
 fi
 
 step "Summary"
